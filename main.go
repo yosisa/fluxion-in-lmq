@@ -1,20 +1,20 @@
 package main
 
 import (
+	"sync"
 	"time"
 
-	"github.com/yosisa/fluxion/buffer"
+	"github.com/cenkalti/backoff"
 	"github.com/yosisa/fluxion/message"
 	"github.com/yosisa/fluxion/plugin"
 	"github.com/yosisa/go-lmq"
 )
 
 type Config struct {
-	Tag     string
-	URL     string
-	Queue   string
-	Multi   bool
-	Timeout buffer.Duration
+	Tag   string
+	URL   string
+	Queue string
+	Multi bool
 }
 
 type InLMQ struct {
@@ -22,6 +22,8 @@ type InLMQ struct {
 	conf Config
 	c    lmq.Client
 	pull func(string, time.Duration) (*lmq.Message, error)
+	stop chan struct{}
+	wg   sync.WaitGroup
 }
 
 func (p *InLMQ) Init(env *plugin.Env) (err error) {
@@ -29,9 +31,7 @@ func (p *InLMQ) Init(env *plugin.Env) (err error) {
 	if err = env.ReadConfig(&p.conf); err != nil {
 		return
 	}
-	if p.conf.Timeout == 0 {
-		p.conf.Timeout = buffer.Duration(30 * time.Second)
-	}
+	p.stop = make(chan struct{})
 	return
 }
 
@@ -47,14 +47,29 @@ func (p *InLMQ) Start() error {
 }
 
 func (p *InLMQ) poll() {
+	p.wg.Add(1)
+	defer p.wg.Done()
+
+	b := newBackOff()
+	fast := make(chan struct{}, 1)
+	fast <- struct{}{}
 	for {
-		m, err := p.pull(p.conf.Queue, time.Duration(p.conf.Timeout))
+		select {
+		case <-fast:
+			b.Reset()
+		case <-time.After(b.NextBackOff()):
+		case <-p.stop:
+			return
+		}
+
+		m, err := p.pull(p.conf.Queue, time.Duration(5*time.Second))
 		if err != nil {
 			if err2, ok := err.(*lmq.Error); !ok || !err2.IsEmpty() {
 				p.env.Log.Error(err)
 			}
 			continue
 		}
+
 		reply := lmq.ReplyAck
 		for {
 			var v interface{}
@@ -75,11 +90,31 @@ func (p *InLMQ) poll() {
 		if err = p.c.Reply(m, reply); err != nil {
 			p.env.Log.Error(err)
 		}
+
+		select {
+		case fast <- struct{}{}:
+		default:
+		}
 	}
 }
 
 func (p *InLMQ) Close() error {
+	p.env.Log.Info("Waiting for stopping consumer")
+	close(p.stop)
+	p.wg.Wait()
+	p.env.Log.Info("Consumer stopped")
 	return nil
+}
+
+func newBackOff() backoff.BackOff {
+	b := backoff.NewExponentialBackOff()
+	b.InitialInterval = time.Second
+	b.RandomizationFactor = 0.2
+	b.Multiplier = 1.2
+	b.MaxInterval = 3 * time.Second
+	b.MaxElapsedTime = 0
+	b.Reset()
+	return b
 }
 
 func main() {
